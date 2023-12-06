@@ -1,7 +1,6 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::Arc,
     net::SocketAddr,
-    collections::HashMap,
     time::Duration,
     thread,
 };
@@ -16,6 +15,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use hyprtxt::hyprtxt;
+use tokio::sync::Mutex;
 
 type SharedState = Arc<Mutex<AppState>>;
 
@@ -64,14 +64,15 @@ struct BatchReq {
     batch_number: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Keyboard {
     score: f32,
     #[serde(with = "BigArray")]
     keys: [Key; 47],
 }
 
-#[derive(Deserialize)]
+#[allow(dead_code)]
+#[derive(Deserialize, Clone, Copy)]
 struct Key {
     lower: char,
     upper: char,
@@ -160,28 +161,28 @@ async fn root(State(_shared_state): State<SharedState>) -> Html<String> {
             
             "form" {
                 "hx-post"="/start-job"
-                "hx-target"="#status"
+                "hx-swap"="outerHTML"
 
                 "div" {
                     "label" {
-                        "for"="job-name"
+                        "for"="job_name"
                         $: "Job Name"
                     }
                     "input" {
                         "type"="text"
-                        "name"="job-name"
-                        "id"="job-name"
+                        "name"="job_name"
+                        "id"="job_name"
                     }
                 }
                 "div" {
                     "label" {
-                        "for"="batch-size"
+                        "for"="batch_size"
                         $: "Batch Size"
                     }
                     "input" {
-                        "type"="text"
-                        "name"="batch-size"
-                        "id"="batch-size"
+                        "type"="number"
+                        "name"="batch_size"
+                        "id"="batch_size"
                     }
                 }
                 "div" {
@@ -190,7 +191,7 @@ async fn root(State(_shared_state): State<SharedState>) -> Html<String> {
                         $: "Batches"
                     }
                     "input" {
-                        "type"="text"
+                        "type"="number"
                         "name"="batches"
                         "id"="batches"
                     }
@@ -203,6 +204,8 @@ async fn root(State(_shared_state): State<SharedState>) -> Html<String> {
             }
 
             "div" {
+                "hx-get"="/update"
+                "hx-trigger"="every 5s"
                 "id"="status"
                 "h3" { $: "Status: INIT" }
             }
@@ -219,26 +222,42 @@ async fn root(State(_shared_state): State<SharedState>) -> Html<String> {
 }
 
 async fn update(State(shared_state): State<SharedState>) -> Html<String> {
-    let state = shared_state.lock().unwrap();
+    let state = shared_state.lock().await;
+
+    let update_layout = |inner: String| -> Html<String> {
+        Html(hyprtxt!(
+            "div" {
+                $: inner
+            }
+        ))
+    };
     
     if state.running {
-        Html(hyprtxt!(
-            "h3" {
-                $: "Job "
-                $: state.job_name
-                $: " Running"
+        update_layout(hyprtxt!(
+            "div" {
+                "h3" {
+                    $: "Job "
+                    $: state.job_name
+                    $: " Running"
+                }
+                $: keyboard(state.keyboards.clone())
             }
         ))
     } else if state.keyboards.len() > 0 {
-        Html(hyprtxt!(
-            "h3" {
-                $: "Job "
-                $: state.job_name
-                $: " Complete"
+        update_layout(hyprtxt!(
+            "div" {
+                "h3" {
+                    $: "Job "
+                    $: state.job_name
+                    $: " Complete"
+                }
+                $: keyboard(state.keyboards.clone())
             }
         ))
     } else {
-        Html(hyprtxt!("h3" { $: "Status: INIT" }))
+        update_layout(hyprtxt!(
+            "h3" { $: "INIT" }
+        ))
     }
 }
 
@@ -246,7 +265,7 @@ async fn add_server(
     State(shared_state): State<SharedState>,
     Form(add_server_req): Form<AddServerReq>,
 ) -> Html<String> {
-    let mut state = shared_state.lock().unwrap();
+    let mut state = shared_state.lock().await;
     state.hosts.push(add_server_req.host);
 
     Html(hyprtxt!(
@@ -268,7 +287,13 @@ async fn start_job(
     State(shared_state): State<SharedState>,
     Form(StartJobReq { job_name, batch_size, batches }): Form<StartJobReq>,
 ) -> Html<String> {
-    let mut state = shared_state.lock().unwrap();
+    let mut state = shared_state.lock().await;
+    if state.running {
+        return Html(hyprtxt!("h1" {
+            "style"="color: red;"
+            $: "ERROR: job already in progress"
+        }))
+    }
     state.job_name = job_name;
     state.batches = batches;
     state.batch_size = batch_size;
@@ -278,19 +303,21 @@ async fn start_job(
     for host in hosts {
         let thread_state = shared_state.clone();
         tokio::spawn(async move {
-            let client = reqwest::blocking::Client::new();
+            let client = reqwest::Client::new();
             loop {
                 let resp = client
                     .get(host.to_string() + "/update")
                     .send()
-                    .unwrap()
+                    .await
+                    .expect("failed request")
                     .json()
-                    .unwrap();
+                    .await
+                    .expect("failed parse");
                 
                 match resp {
                     UpdateResp::InProgress { .. } => thread::sleep(Duration::new(5, 0)),
                     UpdateResp::Init => {
-                        let mut state = thread_state.lock().unwrap();
+                        let mut state = thread_state.lock().await;
                         if state.completed < state.batches {
                             client
                                 .post(host.to_string() + "/new")
@@ -301,14 +328,15 @@ async fn start_job(
                                     batch_number: state.completed,
                                 })
                                 .send()
-                                .unwrap();
+                                .await
+                                .expect("failed post");
                         } else {
                             state.running = false;
                             break;
                         }
                     },
                     UpdateResp::BatchComplete { keyboards } => {
-                        let mut state = thread_state.lock().unwrap();
+                        let mut state = thread_state.lock().await;
                         state.completed += 1;
                         state.keyboards.extend(keyboards.into_iter());
                         if state.completed < state.batches {
@@ -321,6 +349,7 @@ async fn start_job(
                                     batch_number: state.completed,
                                 })
                                 .send()
+                                .await
                                 .unwrap();
                         } else {
                             state.running = false;
@@ -332,24 +361,74 @@ async fn start_job(
         });
     }
 
-    // copy-paste from update
-    if state.running {
-        Html(hyprtxt!(
+    Html(hyprtxt!(
+        "div" {
             "h3" {
                 $: "Job "
                 $: state.job_name
-                $: " Running"
+                $: " Started"
             }
-        ))
-    } else if state.keyboards.len() > 0 && !state.running {
-        Html(hyprtxt!(
-            "h3" {
-                $: "Job "
-                $: state.job_name
-                $: " Complete"
+            "button" {
+                $: "update"
             }
-        ))
-    } else {
-        Html(hyprtxt!("h3" { $: "Status: INIT" }))
-    }
+            "button" {
+                $: "stop job"
+            }
+        }
+    ))
+}
+
+fn keyboard(mut keyboards: Vec<Keyboard>) -> String {
+    if keyboards.len() == 0 { return "".to_string()}
+    keyboards.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+    let keyboard = &keyboards[0];
+    hyprtxt!(
+        "div" {
+            "class"="keyboard"
+            "div" {
+                "class"="row"
+                $: &keyboard.keys[0..13]
+                    .iter()
+                    .map(|key| hyprtxt!("button" {
+                        "class"="button"
+                        $: key.upper
+                    }))
+                    .collect::<Vec<String>>()
+                    .concat()
+            }
+            "div" {
+                "class"="row"
+                $: &keyboard.keys[13..26]
+                    .iter()
+                    .map(|key| hyprtxt!("button" {
+                        "class"="button"
+                        $: key.upper
+                    }))
+                    .collect::<Vec<String>>()
+                    .concat()
+            }
+            "div" {
+                "class"="row"
+                $: &keyboard.keys[26..37]
+                    .iter()
+                    .map(|key| hyprtxt!("button" {
+                        "class"="button"
+                        $: key.upper
+                    }))
+                    .collect::<Vec<String>>()
+                    .concat()
+            }
+            "div" {
+                "class"="row"
+                $: &keyboard.keys[37..47]
+                    .iter()
+                    .map(|key| hyprtxt!("button" {
+                        "class"="button"
+                        $: key.upper
+                    }))
+                    .collect::<Vec<String>>()
+                    .concat()
+            }
+        }
+    )
 }
